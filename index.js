@@ -72,6 +72,21 @@ db.exec(`
     )
 `);
 
+// Teklif geçmişi olayları
+db.exec(`
+    CREATE TABLE IF NOT EXISTS offer_events (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        offer_id   INTEGER NOT NULL,
+        actor_id   INTEGER NOT NULL,
+        event_type TEXT    NOT NULL,
+        amount     REAL,
+        note       TEXT    DEFAULT '',
+        created_at TEXT    DEFAULT (datetime('now')),
+        FOREIGN KEY (offer_id) REFERENCES offers(id),
+        FOREIGN KEY (actor_id) REFERENCES users(id)
+    )
+`);
+
 // Yorumlar tablosu
 db.exec(`
     CREATE TABLE IF NOT EXISTS comments (
@@ -181,6 +196,13 @@ const getTodayOfferUsage = (userId) => {
     `).get(userId);
 
     return Number(row?.total || 0);
+};
+
+const addOfferEvent = (offerId, actorId, eventType, amount = null, note = '') => {
+    db.prepare(`
+        INSERT INTO offer_events (offer_id, actor_id, event_type, amount, note)
+        VALUES (?, ?, ?, ?, ?)
+    `).run(offerId, actorId, eventType, amount, note);
 };
 
 const getFallbackSupportReply = (message, orderNo = null) => {
@@ -810,6 +832,8 @@ app.post('/api/offers', authenticate, (req, res) => {
         VALUES (?, ?, ?, ?, 'pending')
     `).run(parsedProductId, req.user.id, product.user_id, parsedAmount);
 
+    addOfferEvent(result.lastInsertRowid, req.user.id, 'created', parsedAmount, 'İlk teklif oluşturuldu');
+
     const created = db.prepare(`
         SELECT o.id, o.product_id, o.buyer_id, o.seller_id, o.amount, o.status, o.created_at,
                p.title AS product_title, p.price AS product_price
@@ -859,15 +883,44 @@ app.get('/api/offers/received', authenticate, (req, res) => {
     return res.status(200).json({ success: true, offers });
 });
 
+app.get('/api/offers/:offerId/history', authenticate, (req, res) => {
+    const offerId = Number(req.params.offerId);
+    if (!Number.isInteger(offerId) || offerId <= 0) {
+        return res.status(400).json({ success: false, message: 'Geçersiz teklif.' });
+    }
+
+    const offer = db.prepare('SELECT id, buyer_id, seller_id FROM offers WHERE id = ?').get(offerId);
+    if (!offer) {
+        return res.status(404).json({ success: false, message: 'Teklif bulunamadı.' });
+    }
+
+    if (Number(offer.buyer_id) !== Number(req.user.id) && Number(offer.seller_id) !== Number(req.user.id)) {
+        return res.status(403).json({ success: false, message: 'Bu teklif geçmişini görüntüleme yetkin yok.' });
+    }
+
+    const events = db.prepare(`
+        SELECT e.id, e.event_type, e.amount, e.note, e.created_at,
+               e.actor_id,
+               COALESCE(u.name, u.email) AS actor_name
+        FROM offer_events e
+        JOIN users u ON u.id = e.actor_id
+        WHERE e.offer_id = ?
+        ORDER BY e.id ASC
+    `).all(offerId);
+
+    return res.status(200).json({ success: true, events });
+});
+
 app.post('/api/offers/:offerId/respond', authenticate, (req, res) => {
     const offerId = Number(req.params.offerId);
     const action = String(req.body?.action || '').toLowerCase();
+    const counterAmount = Number(req.body?.counterAmount);
 
     if (!Number.isInteger(offerId) || offerId <= 0) {
         return res.status(400).json({ success: false, message: 'Geçersiz teklif.' });
     }
 
-    if (!['accept', 'reject'].includes(action)) {
+    if (!['accept', 'reject', 'counter'].includes(action)) {
         return res.status(400).json({ success: false, message: 'Geçersiz işlem.' });
     }
 
@@ -876,16 +929,40 @@ app.post('/api/offers/:offerId/respond', authenticate, (req, res) => {
         return res.status(404).json({ success: false, message: 'Teklif bulunamadı.' });
     }
 
-    if (Number(offer.seller_id) !== Number(req.user.id)) {
-        return res.status(403).json({ success: false, message: 'Bu teklife işlem yetkin yok.' });
+    const status = String(offer.status);
+    const isSeller = Number(offer.seller_id) === Number(req.user.id);
+    const isBuyer = Number(offer.buyer_id) === Number(req.user.id);
+
+    const canSellerAct = status === 'pending' && isSeller;
+    const canBuyerAct = status === 'countered' && isBuyer;
+
+    if (!canSellerAct && !canBuyerAct) {
+        return res.status(403).json({ success: false, message: 'Bu teklif için işlem yetkin yok.' });
     }
 
-    if (String(offer.status) !== 'pending') {
-        return res.status(400).json({ success: false, message: 'Bu teklif daha önce sonuçlandırılmış.' });
+    if (action === 'counter') {
+        if (!canSellerAct) {
+            return res.status(400).json({ success: false, message: 'Karşı teklif sadece satıcı tarafından, bekleyen teklifte yapılabilir.' });
+        }
+
+        if (Number.isNaN(counterAmount) || counterAmount <= 0) {
+            return res.status(400).json({ success: false, message: 'Karşı teklif tutarı geçerli olmalı.' });
+        }
+
+        db.prepare('UPDATE offers SET amount = ?, status = ? WHERE id = ?').run(counterAmount, 'countered', offerId);
+        addOfferEvent(offerId, req.user.id, 'countered', counterAmount, 'Satıcı karşı teklif gönderdi');
+
+        return res.status(200).json({
+            success: true,
+            message: 'Karşı teklif gönderildi.',
+            status: 'countered',
+            amount: counterAmount
+        });
     }
 
     const nextStatus = action === 'accept' ? 'accepted' : 'rejected';
     db.prepare('UPDATE offers SET status = ? WHERE id = ?').run(nextStatus, offerId);
+    addOfferEvent(offerId, req.user.id, nextStatus, Number(offer.amount), action === 'accept' ? 'Teklif kabul edildi' : 'Teklif reddedildi');
 
     return res.status(200).json({
         success: true,

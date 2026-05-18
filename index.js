@@ -12,6 +12,8 @@ const Database = require('better-sqlite3');
 
 // JWT imzalamak için gizli anahtar (production'da .env dosyasına taşınacak)
 const JWT_SECRET = 'dolap_gizli_anahtar_2026';
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 
 // Veritabanı dosyasını oluşturuyor / açıyoruz (dolap.db adında bir dosya oluşacak)
 const db = new Database('dolap.db');
@@ -87,6 +89,117 @@ const PORT = 3000;
 
 // Sunucunun gelen JSON formatındaki paketleri (verileri) okumasını sağlar
 app.use(express.json());
+
+const supportIntents = [
+    {
+        intent: 'cargo_tracking',
+        patterns: [/kargo/, /teslimat/, /nerede/, /takip/, /siparişim nerede/],
+        answer: 'Kargonuzu uygulamada Profil > Siparişlerim > Takip adımından izleyebilirsiniz. Takip numaranız varsa bu alana girerek anlık kargo durumunu görebilirsiniz. 48 saatten uzun süredir hareket yoksa canlı desteğe bağlanın.'
+    },
+    {
+        intent: 'return_process',
+        patterns: [/iade/, /geri gönder/, /ürünü geri/, /cayma/],
+        answer: 'İade için Profil > Siparişlerim > Sipariş Detayı > İade Talebi adımını kullanın. Ürün tesliminden sonra 14 gün içinde iade talebi oluşturabilirsiniz. Talep onaylandıktan sonra kargo kodu verilir ve ücret iade incelemesinden sonra hesabınıza yansır.'
+    },
+    {
+        intent: 'cancel_process',
+        patterns: [/iptal/, /vazgeç/, /siparişimi iptal/, /alımı iptal/],
+        answer: 'Sipariş henüz kargoya verilmediyse Sipariş Detayı ekranından iptal talebi oluşturabilirsiniz. Kargoya verildiyse doğrudan iptal yerine iade süreci uygulanır. Satıcı 24 saat içinde onay vermezse talep otomatik değerlendirmeye alınır.'
+    },
+    {
+        intent: 'customer_service',
+        patterns: [/müşteri hizmet/, /canlı destek/, /destek/, /yardım/, /şikayet/],
+        answer: 'Müşteri hizmetlerine Profil > Yardım Merkezi > Canlı Destek üzerinden ulaşabilirsiniz. Hızlı çözüm için sipariş numarası, ürün adı ve yaşadığınız sorunu kısa maddelerle paylaşın.'
+    }
+];
+
+const detectSupportIntent = (message) => {
+    const text = String(message || '').toLowerCase();
+    for (const item of supportIntents) {
+        if (item.patterns.some((pattern) => pattern.test(text))) {
+            return item;
+        }
+    }
+    return null;
+};
+
+const getFallbackSupportReply = (message) => {
+    const matchedIntent = detectSupportIntent(message);
+    if (matchedIntent) {
+        return {
+            intent: matchedIntent.intent,
+            reply: matchedIntent.answer
+        };
+    }
+
+    return {
+        intent: 'general',
+        reply: 'Size yardımcı olabilirim. Özellikle "kargom nerede", "iade", "iptal" veya "müşteri hizmetleri" konularından birini yazarsanız adım adım yönlendireyim.'
+    };
+};
+
+const getOpenAISupportReply = async (message, history = []) => {
+    if (!OPENAI_API_KEY || typeof fetch !== 'function') {
+        return null;
+    }
+
+    const safeHistory = Array.isArray(history)
+        ? history
+            .slice(-10)
+            .map((h) => ({
+                role: h.role === 'assistant' ? 'assistant' : 'user',
+                text: String(h.text || '').slice(0, 500)
+            }))
+            .filter((h) => h.text)
+        : [];
+
+    const systemPrompt = `Sen Vitrin uygulamasının destek asistanısın.\nTürkçe, net, kısa ve aksiyon odaklı yanıt ver.\nÖncelik: kargo takibi, iade, iptal, müşteri hizmetleri.\nUydurma bilgi verme; emin değilsen kullanıcıyı yardım merkezine yönlendir.`;
+
+    const input = [
+        {
+            role: 'system',
+            content: [{ type: 'input_text', text: systemPrompt }]
+        },
+        ...safeHistory.map((h) => ({
+            role: h.role,
+            content: [{ type: 'input_text', text: h.text }]
+        })),
+        {
+            role: 'user',
+            content: [{ type: 'input_text', text: String(message || '').slice(0, 1000) }]
+        }
+    ];
+
+    try {
+        const response = await fetch('https://api.openai.com/v1/responses', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${OPENAI_API_KEY}`
+            },
+            body: JSON.stringify({
+                model: OPENAI_MODEL,
+                input,
+                temperature: 0.3,
+                max_output_tokens: 220
+            })
+        });
+
+        if (!response.ok) {
+            return null;
+        }
+
+        const data = await response.json();
+        const reply = data?.output_text?.trim();
+        if (!reply) {
+            return null;
+        }
+
+        return reply;
+    } catch (err) {
+        return null;
+    }
+};
 
 // Ana sayfaya (/) bir istek (Request) geldiğinde çalışacak test rotası (Route)
 app.get('/', (req, res) => {
@@ -561,6 +674,35 @@ app.post('/api/products', authenticate, (req, res) => {
         success: true,
         message: 'Ürün başarıyla eklendi.',
         product: createdProduct
+    });
+});
+
+// Destek Asistanı (AI + fallback)
+app.post('/api/support/chat', async (req, res) => {
+    const { message, history } = req.body || {};
+
+    if (!message || !String(message).trim()) {
+        return res.status(400).json({
+            success: false,
+            message: 'Mesaj alanı zorunludur.'
+        });
+    }
+
+    const normalizedMessage = String(message).trim().slice(0, 1000);
+    const fallback = getFallbackSupportReply(normalizedMessage);
+    const aiReply = await getOpenAISupportReply(normalizedMessage, history);
+
+    return res.status(200).json({
+        success: true,
+        reply: aiReply || fallback.reply,
+        intent: fallback.intent,
+        usedAI: Boolean(aiReply),
+        suggestions: [
+            'Kargom nerede?',
+            'İade nasıl yaparım?',
+            'Sipariş iptali mümkün mü?',
+            'Canlı desteğe nasıl bağlanırım?'
+        ]
     });
 });
 

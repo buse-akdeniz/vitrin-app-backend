@@ -56,6 +56,48 @@ db.exec(`
     )
 `);
 
+// Teklifler tablosu
+db.exec(`
+    CREATE TABLE IF NOT EXISTS offers (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id INTEGER NOT NULL,
+        buyer_id   INTEGER NOT NULL,
+        seller_id  INTEGER NOT NULL,
+        amount     REAL    NOT NULL,
+        status     TEXT    DEFAULT 'pending',
+        created_at TEXT    DEFAULT (datetime('now')),
+        FOREIGN KEY (product_id) REFERENCES products(id),
+        FOREIGN KEY (buyer_id) REFERENCES users(id),
+        FOREIGN KEY (seller_id) REFERENCES users(id)
+    )
+`);
+
+// Yorumlar tablosu
+db.exec(`
+    CREATE TABLE IF NOT EXISTS comments (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id INTEGER NOT NULL,
+        user_id    INTEGER NOT NULL,
+        content    TEXT    NOT NULL,
+        created_at TEXT    DEFAULT (datetime('now')),
+        FOREIGN KEY (product_id) REFERENCES products(id),
+        FOREIGN KEY (user_id) REFERENCES users(id)
+    )
+`);
+
+// Favoriler tablosu
+db.exec(`
+    CREATE TABLE IF NOT EXISTS favorites (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id    INTEGER NOT NULL,
+        product_id INTEGER NOT NULL,
+        created_at TEXT    DEFAULT (datetime('now')),
+        UNIQUE (user_id, product_id),
+        FOREIGN KEY (user_id) REFERENCES users(id),
+        FOREIGN KEY (product_id) REFERENCES products(id)
+    )
+`);
+
 // Var olan veritabanları için sütun migration yardımcıları
 const ensureColumn = (tableName, columnName, definition) => {
     const columns = db.prepare(`PRAGMA table_info(${tableName})`).all().map((c) => c.name);
@@ -126,6 +168,19 @@ const detectSupportIntent = (message) => {
 const normalizeOrderNo = (orderNo) => {
     const normalized = String(orderNo || '').trim().slice(0, 32);
     return normalized || null;
+};
+
+const DAILY_OFFER_LIMIT = 20;
+
+const getTodayOfferUsage = (userId) => {
+    const row = db.prepare(`
+        SELECT COUNT(*) AS total
+        FROM offers
+        WHERE buyer_id = ?
+          AND date(created_at) = date('now')
+    `).get(userId);
+
+    return Number(row?.total || 0);
 };
 
 const getFallbackSupportReply = (message, orderNo = null) => {
@@ -700,6 +755,255 @@ app.post('/api/products', authenticate, (req, res) => {
         message: 'Ürün başarıyla eklendi.',
         product: createdProduct
     });
+});
+
+// ─── Teklif Endpoint'leri ──────────────────────────────────────────────────
+
+app.get('/api/offers/quota', authenticate, (req, res) => {
+    const used = getTodayOfferUsage(req.user.id);
+    const remaining = Math.max(DAILY_OFFER_LIMIT - used, 0);
+
+    return res.status(200).json({
+        success: true,
+        dailyLimit: DAILY_OFFER_LIMIT,
+        used,
+        remaining
+    });
+});
+
+app.post('/api/offers', authenticate, (req, res) => {
+    const { productId, amount } = req.body || {};
+
+    const parsedProductId = Number(productId);
+    const parsedAmount = Number(amount);
+
+    if (!Number.isInteger(parsedProductId) || parsedProductId <= 0) {
+        return res.status(400).json({ success: false, message: 'Geçerli bir ürün seçmelisin.' });
+    }
+
+    if (Number.isNaN(parsedAmount) || parsedAmount <= 0) {
+        return res.status(400).json({ success: false, message: 'Teklif tutarı geçerli olmalı.' });
+    }
+
+    const product = db.prepare('SELECT id, user_id, title, price FROM products WHERE id = ?').get(parsedProductId);
+    if (!product) {
+        return res.status(404).json({ success: false, message: 'Ürün bulunamadı.' });
+    }
+
+    if (Number(product.user_id) === Number(req.user.id)) {
+        return res.status(400).json({ success: false, message: 'Kendi ürününe teklif veremezsin.' });
+    }
+
+    const used = getTodayOfferUsage(req.user.id);
+    if (used >= DAILY_OFFER_LIMIT) {
+        return res.status(429).json({
+            success: false,
+            message: 'Günlük teklif hakkın doldu (20/20).',
+            dailyLimit: DAILY_OFFER_LIMIT,
+            used,
+            remaining: 0
+        });
+    }
+
+    const result = db.prepare(`
+        INSERT INTO offers (product_id, buyer_id, seller_id, amount, status)
+        VALUES (?, ?, ?, ?, 'pending')
+    `).run(parsedProductId, req.user.id, product.user_id, parsedAmount);
+
+    const created = db.prepare(`
+        SELECT o.id, o.product_id, o.buyer_id, o.seller_id, o.amount, o.status, o.created_at,
+               p.title AS product_title, p.price AS product_price
+        FROM offers o
+        JOIN products p ON p.id = o.product_id
+        WHERE o.id = ?
+    `).get(result.lastInsertRowid);
+
+    const newUsed = used + 1;
+    return res.status(201).json({
+        success: true,
+        message: 'Teklif gönderildi.',
+        offer: created,
+        dailyLimit: DAILY_OFFER_LIMIT,
+        used: newUsed,
+        remaining: Math.max(DAILY_OFFER_LIMIT - newUsed, 0)
+    });
+});
+
+app.get('/api/offers/sent', authenticate, (req, res) => {
+    const offers = db.prepare(`
+        SELECT o.id, o.product_id, o.amount, o.status, o.created_at,
+               p.title AS product_title, p.price AS product_price,
+               COALESCE(u.name, u.email) AS seller_name
+        FROM offers o
+        JOIN products p ON p.id = o.product_id
+        JOIN users u ON u.id = o.seller_id
+        WHERE o.buyer_id = ?
+        ORDER BY o.id DESC
+    `).all(req.user.id);
+
+    return res.status(200).json({ success: true, offers });
+});
+
+app.get('/api/offers/received', authenticate, (req, res) => {
+    const offers = db.prepare(`
+        SELECT o.id, o.product_id, o.amount, o.status, o.created_at,
+               p.title AS product_title, p.price AS product_price,
+               COALESCE(u.name, u.email) AS buyer_name
+        FROM offers o
+        JOIN products p ON p.id = o.product_id
+        JOIN users u ON u.id = o.buyer_id
+        WHERE o.seller_id = ?
+        ORDER BY o.id DESC
+    `).all(req.user.id);
+
+    return res.status(200).json({ success: true, offers });
+});
+
+app.post('/api/offers/:offerId/respond', authenticate, (req, res) => {
+    const offerId = Number(req.params.offerId);
+    const action = String(req.body?.action || '').toLowerCase();
+
+    if (!Number.isInteger(offerId) || offerId <= 0) {
+        return res.status(400).json({ success: false, message: 'Geçersiz teklif.' });
+    }
+
+    if (!['accept', 'reject'].includes(action)) {
+        return res.status(400).json({ success: false, message: 'Geçersiz işlem.' });
+    }
+
+    const offer = db.prepare('SELECT * FROM offers WHERE id = ?').get(offerId);
+    if (!offer) {
+        return res.status(404).json({ success: false, message: 'Teklif bulunamadı.' });
+    }
+
+    if (Number(offer.seller_id) !== Number(req.user.id)) {
+        return res.status(403).json({ success: false, message: 'Bu teklife işlem yetkin yok.' });
+    }
+
+    if (String(offer.status) !== 'pending') {
+        return res.status(400).json({ success: false, message: 'Bu teklif daha önce sonuçlandırılmış.' });
+    }
+
+    const nextStatus = action === 'accept' ? 'accepted' : 'rejected';
+    db.prepare('UPDATE offers SET status = ? WHERE id = ?').run(nextStatus, offerId);
+
+    return res.status(200).json({
+        success: true,
+        message: action === 'accept' ? 'Teklif kabul edildi.' : 'Teklif reddedildi.',
+        status: nextStatus
+    });
+});
+
+// ─── Yorum Endpoint'leri ───────────────────────────────────────────────────
+
+app.get('/api/products/:productId/comments', (req, res) => {
+    const productId = Number(req.params.productId);
+    if (!Number.isInteger(productId) || productId <= 0) {
+        return res.status(400).json({ success: false, message: 'Geçersiz ürün.' });
+    }
+
+    const comments = db.prepare(`
+        SELECT c.id, c.content, c.created_at,
+               c.user_id,
+               COALESCE(u.name, u.email) AS user_name
+        FROM comments c
+        JOIN users u ON u.id = c.user_id
+        WHERE c.product_id = ?
+        ORDER BY c.id DESC
+    `).all(productId);
+
+    return res.status(200).json({ success: true, comments });
+});
+
+app.post('/api/products/:productId/comments', authenticate, (req, res) => {
+    const productId = Number(req.params.productId);
+    const content = String(req.body?.content || '').trim();
+
+    if (!Number.isInteger(productId) || productId <= 0) {
+        return res.status(400).json({ success: false, message: 'Geçersiz ürün.' });
+    }
+
+    if (!content) {
+        return res.status(400).json({ success: false, message: 'Yorum boş olamaz.' });
+    }
+
+    if (content.length > 500) {
+        return res.status(400).json({ success: false, message: 'Yorum en fazla 500 karakter olabilir.' });
+    }
+
+    const product = db.prepare('SELECT id FROM products WHERE id = ?').get(productId);
+    if (!product) {
+        return res.status(404).json({ success: false, message: 'Ürün bulunamadı.' });
+    }
+
+    const result = db.prepare(`
+        INSERT INTO comments (product_id, user_id, content)
+        VALUES (?, ?, ?)
+    `).run(productId, req.user.id, content);
+
+    const comment = db.prepare(`
+        SELECT c.id, c.content, c.created_at, c.user_id,
+               COALESCE(u.name, u.email) AS user_name
+        FROM comments c
+        JOIN users u ON u.id = c.user_id
+        WHERE c.id = ?
+    `).get(result.lastInsertRowid);
+
+    return res.status(201).json({ success: true, message: 'Yorum eklendi.', comment });
+});
+
+// ─── Favori Endpoint'leri ──────────────────────────────────────────────────
+
+app.get('/api/favorites', authenticate, (req, res) => {
+    const favorites = db.prepare(`
+        SELECT
+            f.id AS favorite_id,
+            f.created_at AS favorited_at,
+            p.id,
+            p.title,
+            p.price,
+            p.brand,
+            p.size,
+            p.item_condition,
+            p.shipping_type,
+            p.image_url
+        FROM favorites f
+        JOIN products p ON p.id = f.product_id
+        WHERE f.user_id = ?
+        ORDER BY f.id DESC
+    `).all(req.user.id);
+
+    return res.status(200).json({ success: true, products: favorites });
+});
+
+app.post('/api/favorites/:productId', authenticate, (req, res) => {
+    const productId = Number(req.params.productId);
+    if (!Number.isInteger(productId) || productId <= 0) {
+        return res.status(400).json({ success: false, message: 'Geçersiz ürün.' });
+    }
+
+    const product = db.prepare('SELECT id FROM products WHERE id = ?').get(productId);
+    if (!product) {
+        return res.status(404).json({ success: false, message: 'Ürün bulunamadı.' });
+    }
+
+    const existing = db.prepare('SELECT id FROM favorites WHERE user_id = ? AND product_id = ?').get(req.user.id, productId);
+    if (existing) {
+        return res.status(200).json({ success: true, message: 'Ürün zaten favorilerde.', isFavorite: true });
+    }
+
+    db.prepare('INSERT INTO favorites (user_id, product_id) VALUES (?, ?)').run(req.user.id, productId);
+    return res.status(201).json({ success: true, message: 'Favorilere eklendi.', isFavorite: true });
+});
+
+app.delete('/api/favorites/:productId', authenticate, (req, res) => {
+    const productId = Number(req.params.productId);
+    if (!Number.isInteger(productId) || productId <= 0) {
+        return res.status(400).json({ success: false, message: 'Geçersiz ürün.' });
+    }
+
+    db.prepare('DELETE FROM favorites WHERE user_id = ? AND product_id = ?').run(req.user.id, productId);
+    return res.status(200).json({ success: true, message: 'Favorilerden kaldırıldı.', isFavorite: false });
 });
 
 // Destek Asistanı (AI + fallback)

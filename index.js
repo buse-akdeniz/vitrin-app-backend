@@ -48,6 +48,7 @@ db.exec(`
         gender      TEXT    DEFAULT '',
         item_condition TEXT DEFAULT '',
         shipping_type TEXT DEFAULT 'seller',
+        package_size TEXT DEFAULT 'medium',
         color       TEXT    DEFAULT '',
         image_url   TEXT    DEFAULT '',
         description TEXT    DEFAULT '',
@@ -132,6 +133,7 @@ ensureColumn('products', 'shoe_size', "shoe_size TEXT DEFAULT ''");
 ensureColumn('products', 'gender', "gender TEXT DEFAULT ''");
 ensureColumn('products', 'item_condition', "item_condition TEXT DEFAULT ''");
 ensureColumn('products', 'shipping_type', "shipping_type TEXT DEFAULT 'seller'");
+ensureColumn('products', 'package_size', "package_size TEXT DEFAULT 'medium'");
 ensureColumn('products', 'color', "color TEXT DEFAULT ''");
 ensureColumn('products', 'is_sos', 'is_sos INTEGER DEFAULT 0');
 ensureColumn('products', 'sos_discount_percent', 'sos_discount_percent INTEGER DEFAULT 0');
@@ -498,6 +500,8 @@ app.get('/api/products', (req, res) => {
         gender,
         condition,
         shippingType,
+        packageSize,
+        descriptionQuery,
         color,
         minPrice,
         maxPrice,
@@ -562,9 +566,17 @@ app.get('/api/products', (req, res) => {
         where.push('LOWER(p.shipping_type) = @shippingType');
         params.shippingType = String(shippingType).toLowerCase();
     }
+    if (packageSize) {
+        where.push('LOWER(p.package_size) = @packageSize');
+        params.packageSize = String(packageSize).toLowerCase();
+    }
     if (color) {
         where.push('LOWER(p.color) = @color');
         params.color = String(color).toLowerCase();
+    }
+    if (descriptionQuery) {
+        where.push('LOWER(p.description) LIKE @descriptionQuery');
+        params.descriptionQuery = `%${String(descriptionQuery).toLowerCase()}%`;
     }
 
     if (minPrice !== undefined) {
@@ -609,6 +621,7 @@ app.get('/api/products', (req, res) => {
             p.gender,
             p.item_condition,
             p.shipping_type,
+            p.package_size,
             p.color,
             p.image_url,
             p.description,
@@ -701,6 +714,7 @@ app.post('/api/products', authenticate, (req, res) => {
         gender,
         condition,
         shippingType,
+        packageSize,
         color,
         imageUrl,
         description,
@@ -740,10 +754,10 @@ app.post('/api/products', authenticate, (req, res) => {
     const result = db.prepare(`
         INSERT INTO products (
             user_id, title, price, category, brand, size, fabric_type,
-            shoe_size, gender, item_condition, shipping_type, color,
+            shoe_size, gender, item_condition, shipping_type, package_size, color,
             image_url, description, is_sos, sos_discount_percent
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
         req.user.id,
         String(title).trim(),
@@ -756,6 +770,7 @@ app.post('/api/products', authenticate, (req, res) => {
         gender ? String(gender).trim() : '',
         condition ? String(condition).trim() : '',
         shippingType ? String(shippingType).trim() : 'seller',
+        packageSize ? String(packageSize).trim() : 'medium',
         color ? String(color).trim() : '',
         imageUrl ? String(imageUrl).trim() : '',
         description ? String(description).trim() : '',
@@ -766,7 +781,7 @@ app.post('/api/products', authenticate, (req, res) => {
     const createdProduct = db.prepare(`
         SELECT
             id, title, price, category, brand, size, fabric_type, shoe_size,
-            gender, item_condition, shipping_type, color, image_url, description,
+            gender, item_condition, shipping_type, package_size, color, image_url, description,
             is_sos, sos_discount_percent, created_at
         FROM products
         WHERE id = ?
@@ -776,6 +791,71 @@ app.post('/api/products', authenticate, (req, res) => {
         success: true,
         message: 'Ürün başarıyla eklendi.',
         product: createdProduct
+    });
+});
+
+app.get('/api/products/price-insights', (req, res) => {
+    const category = String(req.query.category || '').trim();
+    const brand = String(req.query.brand || '').trim();
+    const title = String(req.query.title || '').trim();
+
+    const where = [];
+    const params = {};
+
+    if (category) {
+        where.push('LOWER(category) = @category');
+        params.category = category.toLowerCase();
+    }
+    if (brand) {
+        where.push('LOWER(brand) = @brand');
+        params.brand = brand.toLowerCase();
+    }
+
+    const titleTokens = title
+        .toLowerCase()
+        .split(/\s+/)
+        .map((t) => t.trim())
+        .filter((t) => t.length >= 3)
+        .slice(0, 3);
+
+    titleTokens.forEach((token, i) => {
+        where.push(`LOWER(title) LIKE @titleToken${i}`);
+        params[`titleToken${i}`] = `%${token}%`;
+    });
+
+    const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+
+    const products = db.prepare(`
+        SELECT id, title, price, category, brand, created_at
+        FROM products
+        ${whereSql}
+        ORDER BY id DESC
+        LIMIT 30
+    `).all(params);
+
+    if (!products.length) {
+        return res.status(200).json({
+            success: true,
+            count: 0,
+            avgPrice: null,
+            minPrice: null,
+            maxPrice: null,
+            similarProducts: []
+        });
+    }
+
+    const prices = products.map((p) => Number(p.price)).filter((p) => !Number.isNaN(p));
+    const avgPrice = prices.reduce((sum, v) => sum + v, 0) / prices.length;
+    const minPrice = Math.min(...prices);
+    const maxPrice = Math.max(...prices);
+
+    return res.status(200).json({
+        success: true,
+        count: products.length,
+        avgPrice: Number(avgPrice.toFixed(2)),
+        minPrice,
+        maxPrice,
+        similarProducts: products
     });
 });
 

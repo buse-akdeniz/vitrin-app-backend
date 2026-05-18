@@ -127,6 +127,62 @@ db.exec(`
     )
 `);
 
+// Siparişler tablosu
+db.exec(`
+    CREATE TABLE IF NOT EXISTS orders (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        offer_id         INTEGER,
+        product_id       INTEGER NOT NULL,
+        buyer_id         INTEGER NOT NULL,
+        seller_id        INTEGER NOT NULL,
+        amount           REAL    NOT NULL,
+        shipping_type    TEXT    DEFAULT 'seller',
+        package_size     TEXT    DEFAULT 'medium',
+        order_status     TEXT    DEFAULT 'created',
+        tracking_no      TEXT    DEFAULT '',
+        cancel_requested INTEGER DEFAULT 0,
+        return_requested INTEGER DEFAULT 0,
+        created_at       TEXT    DEFAULT (datetime('now')),
+        FOREIGN KEY (offer_id) REFERENCES offers(id),
+        FOREIGN KEY (product_id) REFERENCES products(id),
+        FOREIGN KEY (buyer_id) REFERENCES users(id),
+        FOREIGN KEY (seller_id) REFERENCES users(id)
+    )
+`);
+
+// Sipariş takip olayları
+db.exec(`
+    CREATE TABLE IF NOT EXISTS order_events (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        order_id   INTEGER NOT NULL,
+        actor_id   INTEGER NOT NULL,
+        event_type TEXT    NOT NULL,
+        note       TEXT    DEFAULT '',
+        created_at TEXT    DEFAULT (datetime('now')),
+        FOREIGN KEY (order_id) REFERENCES orders(id),
+        FOREIGN KEY (actor_id) REFERENCES users(id)
+    )
+`);
+
+// Bildirimler
+db.exec(`
+    CREATE TABLE IF NOT EXISTS notifications (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id    INTEGER NOT NULL,
+        type       TEXT    NOT NULL,
+        title      TEXT    NOT NULL,
+        message    TEXT    NOT NULL,
+        data_json  TEXT    DEFAULT '{}',
+        is_read    INTEGER DEFAULT 0,
+        created_at TEXT    DEFAULT (datetime('now')),
+        FOREIGN KEY (user_id) REFERENCES users(id)
+    )
+`);
+
+db.exec('CREATE INDEX IF NOT EXISTS idx_orders_buyer ON orders(buyer_id, id DESC)');
+db.exec('CREATE INDEX IF NOT EXISTS idx_orders_seller ON orders(seller_id, id DESC)');
+db.exec('CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, is_read, id DESC)');
+
 // Var olan veritabanları için sütun migration yardımcıları
 const ensureColumn = (tableName, columnName, definition) => {
     const columns = db.prepare(`PRAGMA table_info(${tableName})`).all().map((c) => c.name);
@@ -138,6 +194,7 @@ const ensureColumn = (tableName, columnName, definition) => {
 ensureColumn('users', 'total_sales', 'total_sales INTEGER DEFAULT 0');
 ensureColumn('users', 'seller_rating', 'seller_rating REAL DEFAULT 0');
 ensureColumn('users', 'is_star_seller', 'is_star_seller INTEGER DEFAULT 0');
+ensureColumn('users', 'is_verified', 'is_verified INTEGER DEFAULT 0');
 
 ensureColumn('products', 'brand', "brand TEXT DEFAULT ''");
 ensureColumn('products', 'size', "size TEXT DEFAULT ''");
@@ -150,6 +207,9 @@ ensureColumn('products', 'package_size', "package_size TEXT DEFAULT 'medium'");
 ensureColumn('products', 'color', "color TEXT DEFAULT ''");
 ensureColumn('products', 'is_sos', 'is_sos INTEGER DEFAULT 0');
 ensureColumn('products', 'sos_discount_percent', 'sos_discount_percent INTEGER DEFAULT 0');
+ensureColumn('products', 'sale_status', "sale_status TEXT DEFAULT 'available'");
+
+ensureColumn('offers', 'order_id', 'order_id INTEGER');
 
 console.log('Veritabanı bağlantısı kuruldu ve tablo hazır.');
 
@@ -218,6 +278,20 @@ const addOfferEvent = (offerId, actorId, eventType, amount = null, note = '') =>
         INSERT INTO offer_events (offer_id, actor_id, event_type, amount, note)
         VALUES (?, ?, ?, ?, ?)
     `).run(offerId, actorId, eventType, amount, note);
+};
+
+const addOrderEvent = (orderId, actorId, eventType, note = '') => {
+    db.prepare(`
+        INSERT INTO order_events (order_id, actor_id, event_type, note)
+        VALUES (?, ?, ?, ?)
+    `).run(orderId, actorId, eventType, note);
+};
+
+const notifyUser = (userId, type, title, message, data = {}) => {
+    db.prepare(`
+        INSERT INTO notifications (user_id, type, title, message, data_json)
+        VALUES (?, ?, ?, ?, ?)
+    `).run(userId, type, title, message, JSON.stringify(data || {}));
 };
 
 const getFallbackSupportReply = (message, orderNo = null) => {
@@ -462,7 +536,7 @@ const authenticate = (req, res, next) => {
 // Profil Görüntüleme (GET)
 app.get('/api/profile', authenticate, (req, res) => {
     const user = db.prepare(
-        'SELECT id, email, name, bio, created_at FROM users WHERE id = ?'
+        'SELECT id, email, name, bio, created_at, total_sales, seller_rating, is_star_seller, is_verified FROM users WHERE id = ?'
     ).get(req.user.id);
 
     if (!user) {
@@ -492,7 +566,7 @@ app.put('/api/profile', authenticate, (req, res) => {
     );
 
     const updated = db.prepare(
-        'SELECT id, email, name, bio, created_at FROM users WHERE id = ?'
+        'SELECT id, email, name, bio, created_at, total_sales, seller_rating, is_star_seller, is_verified FROM users WHERE id = ?'
     ).get(req.user.id);
 
     console.log(`Profil güncellendi — ID: ${req.user.id}`);
@@ -926,6 +1000,10 @@ app.post('/api/offers', authenticate, (req, res) => {
     `).run(parsedProductId, req.user.id, product.user_id, parsedAmount);
 
     addOfferEvent(result.lastInsertRowid, req.user.id, 'created', parsedAmount, 'İlk teklif oluşturuldu');
+    notifyUser(product.user_id, 'offer_received', 'Yeni teklif alındı', `${product.title} için ₺${parsedAmount} teklif geldi.`, {
+        offerId: result.lastInsertRowid,
+        productId: parsedProductId
+    });
 
     const created = db.prepare(`
         SELECT o.id, o.product_id, o.buyer_id, o.seller_id, o.amount, o.status, o.created_at,
@@ -1044,6 +1122,9 @@ app.post('/api/offers/:offerId/respond', authenticate, (req, res) => {
 
         db.prepare('UPDATE offers SET amount = ?, status = ? WHERE id = ?').run(counterAmount, 'countered', offerId);
         addOfferEvent(offerId, req.user.id, 'countered', counterAmount, 'Satıcı karşı teklif gönderdi');
+        notifyUser(offer.buyer_id, 'offer_countered', 'Karşı teklif geldi', `Teklifinize karşı ₺${counterAmount} tutarında yeni teklif geldi.`, {
+            offerId
+        });
 
         return res.status(200).json({
             success: true,
@@ -1056,6 +1137,38 @@ app.post('/api/offers/:offerId/respond', authenticate, (req, res) => {
     const nextStatus = action === 'accept' ? 'accepted' : 'rejected';
     db.prepare('UPDATE offers SET status = ? WHERE id = ?').run(nextStatus, offerId);
     addOfferEvent(offerId, req.user.id, nextStatus, Number(offer.amount), action === 'accept' ? 'Teklif kabul edildi' : 'Teklif reddedildi');
+
+    if (nextStatus === 'accepted') {
+        const product = db.prepare('SELECT id, title, shipping_type, package_size FROM products WHERE id = ?').get(offer.product_id);
+        const orderResult = db.prepare(`
+            INSERT INTO orders (offer_id, product_id, buyer_id, seller_id, amount, shipping_type, package_size, order_status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'created')
+        `).run(
+            offer.id,
+            offer.product_id,
+            offer.buyer_id,
+            offer.seller_id,
+            offer.amount,
+            product?.shipping_type || 'seller',
+            product?.package_size || 'medium'
+        );
+
+        db.prepare('UPDATE offers SET order_id = ? WHERE id = ?').run(orderResult.lastInsertRowid, offer.id);
+        db.prepare("UPDATE products SET sale_status = 'sold' WHERE id = ?").run(offer.product_id);
+        db.prepare('UPDATE users SET total_sales = COALESCE(total_sales, 0) + 1 WHERE id = ?').run(offer.seller_id);
+
+        addOrderEvent(orderResult.lastInsertRowid, req.user.id, 'order_created', 'Teklif kabul edildi, sipariş oluşturuldu');
+        notifyUser(offer.buyer_id, 'offer_accepted', 'Teklifin kabul edildi', `${product?.title || 'Ürün'} için teklifin kabul edildi.`, {
+            offerId,
+            orderId: orderResult.lastInsertRowid
+        });
+        notifyUser(offer.seller_id, 'order_created', 'Yeni sipariş oluştu', `${product?.title || 'Ürün'} için sipariş oluşturuldu.`, {
+            offerId,
+            orderId: orderResult.lastInsertRowid
+        });
+    } else {
+        notifyUser(offer.buyer_id, 'offer_rejected', 'Teklif reddedildi', 'Gönderdiğiniz teklif reddedildi.', { offerId });
+    }
 
     return res.status(200).json({
         success: true,
@@ -1296,6 +1409,236 @@ app.get('/api/products/recommended', authenticate, (req, res) => {
         success: true,
         products: scored.slice(0, 30)
     });
+});
+
+// ─── Satıcı Paneli Endpoint'leri ───────────────────────────────────────────
+
+app.get('/api/seller/panel', authenticate, (req, res) => {
+    const userId = Number(req.user.id);
+    const seller = db.prepare(`
+        SELECT id, email, name, total_sales, seller_rating, is_star_seller, is_verified
+        FROM users WHERE id = ?
+    `).get(userId);
+
+    const activeProducts = db.prepare(
+        "SELECT COUNT(*) AS total FROM products WHERE user_id = ? AND COALESCE(sale_status, 'available') = 'available'"
+    ).get(userId)?.total || 0;
+
+    const pendingShipments = db.prepare(
+        "SELECT COUNT(*) AS total FROM orders WHERE seller_id = ? AND order_status IN ('created', 'packed')"
+    ).get(userId)?.total || 0;
+
+    return res.status(200).json({
+        success: true,
+        seller,
+        stats: {
+            activeProducts: Number(activeProducts),
+            pendingShipments: Number(pendingShipments),
+            totalSales: Number(seller?.total_sales || 0)
+        },
+        trust: {
+            rating: Number(seller?.seller_rating || 0),
+            isStarSeller: Number(seller?.is_star_seller || 0) === 1,
+            isVerified: Number(seller?.is_verified || 0) === 1,
+            badge: Number(seller?.is_verified || 0) === 1 ? 'Doğrulanmış Satıcı' : 'Standart Satıcı'
+        }
+    });
+});
+
+app.get('/api/seller/products', authenticate, (req, res) => {
+    const products = db.prepare(`
+        SELECT id, title, price, category, brand, size, shipping_type, package_size, image_url, description, created_at,
+               COALESCE(sale_status, 'available') AS sale_status
+        FROM products
+        WHERE user_id = ?
+        ORDER BY id DESC
+    `).all(req.user.id);
+
+    return res.status(200).json({ success: true, products });
+});
+
+app.put('/api/seller/products/:productId', authenticate, (req, res) => {
+    const productId = Number(req.params.productId);
+    const { title, description, price, shippingType, packageSize, saleStatus } = req.body || {};
+
+    const product = db.prepare('SELECT id, user_id FROM products WHERE id = ?').get(productId);
+    if (!product) return res.status(404).json({ success: false, message: 'Ürün bulunamadı.' });
+    if (Number(product.user_id) !== Number(req.user.id)) return res.status(403).json({ success: false, message: 'Yetki yok.' });
+
+    const validSaleStatus = ['available', 'reserved', 'sold'];
+    const normalizedSaleStatus = validSaleStatus.includes(String(saleStatus || '').toLowerCase())
+        ? String(saleStatus).toLowerCase()
+        : null;
+
+    db.prepare(`
+        UPDATE products
+        SET title = COALESCE(?, title),
+            description = COALESCE(?, description),
+            price = COALESCE(?, price),
+            shipping_type = COALESCE(?, shipping_type),
+            package_size = COALESCE(?, package_size),
+            sale_status = COALESCE(?, sale_status)
+        WHERE id = ?
+    `).run(
+        title ? String(title).trim() : null,
+        description ? String(description).trim() : null,
+        Number.isFinite(Number(price)) ? Number(price) : null,
+        shippingType ? String(shippingType).trim() : null,
+        packageSize ? String(packageSize).trim() : null,
+        normalizedSaleStatus,
+        productId
+    );
+
+    const updated = db.prepare('SELECT * FROM products WHERE id = ?').get(productId);
+    return res.status(200).json({ success: true, message: 'Ürün güncellendi.', product: updated });
+});
+
+app.get('/api/seller/orders', authenticate, (req, res) => {
+    const orders = db.prepare(`
+        SELECT o.*, p.title AS product_title, p.image_url,
+               COALESCE(u.name, u.email) AS buyer_name
+        FROM orders o
+        JOIN products p ON p.id = o.product_id
+        JOIN users u ON u.id = o.buyer_id
+        WHERE o.seller_id = ?
+        ORDER BY o.id DESC
+    `).all(req.user.id);
+
+    return res.status(200).json({ success: true, orders });
+});
+
+app.post('/api/seller/orders/:orderId/ship', authenticate, (req, res) => {
+    const orderId = Number(req.params.orderId);
+    const trackingNo = String(req.body?.trackingNo || '').trim();
+    const shipmentStatus = String(req.body?.shipmentStatus || 'shipped').toLowerCase();
+
+    const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(orderId);
+    if (!order) return res.status(404).json({ success: false, message: 'Sipariş bulunamadı.' });
+    if (Number(order.seller_id) !== Number(req.user.id)) return res.status(403).json({ success: false, message: 'Yetki yok.' });
+
+    const valid = ['packed', 'shipped', 'in_transit'];
+    const next = valid.includes(shipmentStatus) ? shipmentStatus : 'shipped';
+
+    db.prepare('UPDATE orders SET tracking_no = COALESCE(?, tracking_no), order_status = ? WHERE id = ?')
+        .run(trackingNo || null, next, orderId);
+
+    addOrderEvent(orderId, req.user.id, next, trackingNo ? `Takip No: ${trackingNo}` : 'Kargo durumu güncellendi');
+    notifyUser(order.buyer_id, 'shipment_update', 'Kargo güncellendi', `Siparişinizin kargo durumu: ${next}`, { orderId });
+
+    return res.status(200).json({ success: true, message: 'Kargo durumu güncellendi.', orderStatus: next });
+});
+
+app.post('/api/seller/orders/:orderId/deliver', authenticate, (req, res) => {
+    const orderId = Number(req.params.orderId);
+    const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(orderId);
+    if (!order) return res.status(404).json({ success: false, message: 'Sipariş bulunamadı.' });
+    if (Number(order.seller_id) !== Number(req.user.id)) return res.status(403).json({ success: false, message: 'Yetki yok.' });
+
+    db.prepare("UPDATE orders SET order_status = 'delivered' WHERE id = ?").run(orderId);
+    addOrderEvent(orderId, req.user.id, 'delivered', 'Sipariş teslim edildi.');
+    notifyUser(order.buyer_id, 'order_delivered', 'Sipariş teslim edildi', 'Siparişiniz teslim edildi olarak işaretlendi.', { orderId });
+
+    return res.status(200).json({ success: true, message: 'Sipariş teslim edildi olarak güncellendi.' });
+});
+
+// ─── Alıcı Paneli Endpoint'leri ───────────────────────────────────────────
+
+app.get('/api/buyer/orders', authenticate, (req, res) => {
+    const orders = db.prepare(`
+        SELECT o.*, p.title AS product_title, p.image_url,
+               COALESCE(u.name, u.email) AS seller_name,
+               COALESCE(u.seller_rating, 0) AS seller_rating,
+               COALESCE(u.is_star_seller, 0) AS is_star_seller,
+               COALESCE(u.is_verified, 0) AS is_verified
+        FROM orders o
+        JOIN products p ON p.id = o.product_id
+        JOIN users u ON u.id = o.seller_id
+        WHERE o.buyer_id = ?
+        ORDER BY o.id DESC
+    `).all(req.user.id);
+
+    return res.status(200).json({ success: true, orders });
+});
+
+app.post('/api/buyer/orders/:orderId/cancel-request', authenticate, (req, res) => {
+    const orderId = Number(req.params.orderId);
+    const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(orderId);
+    if (!order) return res.status(404).json({ success: false, message: 'Sipariş bulunamadı.' });
+    if (Number(order.buyer_id) !== Number(req.user.id)) return res.status(403).json({ success: false, message: 'Yetki yok.' });
+
+    if (!['created', 'packed'].includes(String(order.order_status))) {
+        return res.status(400).json({ success: false, message: 'Bu aşamada iptal talebi açılamaz.' });
+    }
+
+    db.prepare('UPDATE orders SET cancel_requested = 1 WHERE id = ?').run(orderId);
+    addOrderEvent(orderId, req.user.id, 'cancel_requested', 'Alıcı iptal talebi oluşturdu.');
+    notifyUser(order.seller_id, 'cancel_request', 'İptal talebi alındı', 'Bir sipariş için iptal talebi oluşturuldu.', { orderId });
+
+    return res.status(200).json({ success: true, message: 'İptal talebi oluşturuldu.' });
+});
+
+app.post('/api/buyer/orders/:orderId/return-request', authenticate, (req, res) => {
+    const orderId = Number(req.params.orderId);
+    const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(orderId);
+    if (!order) return res.status(404).json({ success: false, message: 'Sipariş bulunamadı.' });
+    if (Number(order.buyer_id) !== Number(req.user.id)) return res.status(403).json({ success: false, message: 'Yetki yok.' });
+
+    if (String(order.order_status) !== 'delivered') {
+        return res.status(400).json({ success: false, message: 'İade talebi için sipariş teslim edilmiş olmalı.' });
+    }
+
+    db.prepare('UPDATE orders SET return_requested = 1, order_status = ? WHERE id = ?').run('return_requested', orderId);
+    addOrderEvent(orderId, req.user.id, 'return_requested', 'Alıcı iade talebi oluşturdu.');
+    notifyUser(order.seller_id, 'return_request', 'İade talebi alındı', 'Bir sipariş için iade talebi oluşturuldu.', { orderId });
+
+    return res.status(200).json({ success: true, message: 'İade talebi oluşturuldu.' });
+});
+
+app.get('/api/orders/:orderId/tracking', authenticate, (req, res) => {
+    const orderId = Number(req.params.orderId);
+    const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(orderId);
+    if (!order) return res.status(404).json({ success: false, message: 'Sipariş bulunamadı.' });
+
+    const actorId = Number(req.user.id);
+    if (actorId !== Number(order.buyer_id) && actorId !== Number(order.seller_id)) {
+        return res.status(403).json({ success: false, message: 'Yetki yok.' });
+    }
+
+    const events = db.prepare(`
+        SELECT e.id, e.event_type, e.note, e.created_at,
+               COALESCE(u.name, u.email) AS actor_name
+        FROM order_events e
+        JOIN users u ON u.id = e.actor_id
+        WHERE e.order_id = ?
+        ORDER BY e.id ASC
+    `).all(orderId);
+
+    return res.status(200).json({ success: true, order, events });
+});
+
+// ─── Bildirim Endpoint'leri ───────────────────────────────────────────────
+
+app.get('/api/notifications', authenticate, (req, res) => {
+    const notifications = db.prepare(`
+        SELECT id, type, title, message, data_json, is_read, created_at
+        FROM notifications
+        WHERE user_id = ?
+        ORDER BY id DESC
+        LIMIT 100
+    `).all(req.user.id);
+
+    return res.status(200).json({ success: true, notifications });
+});
+
+app.post('/api/notifications/:notificationId/read', authenticate, (req, res) => {
+    const notificationId = Number(req.params.notificationId);
+    db.prepare('UPDATE notifications SET is_read = 1 WHERE id = ? AND user_id = ?').run(notificationId, req.user.id);
+    return res.status(200).json({ success: true, message: 'Okundu olarak işaretlendi.' });
+});
+
+app.post('/api/notifications/read-all', authenticate, (req, res) => {
+    db.prepare('UPDATE notifications SET is_read = 1 WHERE user_id = ?').run(req.user.id);
+    return res.status(200).json({ success: true, message: 'Tüm bildirimler okundu.' });
 });
 
 // Destek Asistanı (AI + fallback)

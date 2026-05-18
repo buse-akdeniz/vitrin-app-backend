@@ -1560,6 +1560,32 @@ app.get('/api/buyer/orders', authenticate, (req, res) => {
     return res.status(200).json({ success: true, orders });
 });
 
+app.get('/api/buyer/orders/badges', authenticate, (req, res) => {
+    const userId = Number(req.user.id);
+
+    const activeShipmentCount = db.prepare(`
+        SELECT COUNT(*) AS total
+        FROM orders
+        WHERE buyer_id = ?
+          AND order_status IN ('created', 'packed', 'shipped', 'in_transit', 'return_requested')
+    `).get(userId)?.total || 0;
+
+    const deliveredCount = db.prepare(`
+        SELECT COUNT(*) AS total
+        FROM orders
+        WHERE buyer_id = ?
+          AND order_status = 'delivered'
+    `).get(userId)?.total || 0;
+
+    return res.status(200).json({
+        success: true,
+        badges: {
+            activeShipmentCount: Number(activeShipmentCount),
+            deliveredCount: Number(deliveredCount)
+        }
+    });
+});
+
 app.post('/api/buyer/orders/:orderId/cancel-request', authenticate, (req, res) => {
     const orderId = Number(req.params.orderId);
     const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(orderId);
@@ -1628,6 +1654,16 @@ app.get('/api/notifications', authenticate, (req, res) => {
     `).all(req.user.id);
 
     return res.status(200).json({ success: true, notifications });
+});
+
+app.get('/api/notifications/unread-count', authenticate, (req, res) => {
+    const unreadCount = db.prepare(`
+        SELECT COUNT(*) AS total
+        FROM notifications
+        WHERE user_id = ? AND is_read = 0
+    `).get(req.user.id)?.total || 0;
+
+    return res.status(200).json({ success: true, unreadCount: Number(unreadCount) });
 });
 
 app.post('/api/notifications/:notificationId/read', authenticate, (req, res) => {

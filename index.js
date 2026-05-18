@@ -123,9 +123,28 @@ const detectSupportIntent = (message) => {
     return null;
 };
 
-const getFallbackSupportReply = (message) => {
+const normalizeOrderNo = (orderNo) => {
+    const normalized = String(orderNo || '').trim().slice(0, 32);
+    return normalized || null;
+};
+
+const getFallbackSupportReply = (message, orderNo = null) => {
     const matchedIntent = detectSupportIntent(message);
     if (matchedIntent) {
+        if (matchedIntent.intent === 'cargo_tracking' && orderNo) {
+            return {
+                intent: matchedIntent.intent,
+                reply: `Sipariş no ${orderNo} için kargo takibini Profil > Siparişlerim > Sipariş Detayı > Takip alanından kontrol edebilirsiniz. Durum 48 saatten uzun süredir güncellenmiyorsa canlı desteğe bağlanmanızı öneririm.`
+            };
+        }
+
+        if ((matchedIntent.intent === 'return_process' || matchedIntent.intent === 'cancel_process') && orderNo) {
+            return {
+                intent: matchedIntent.intent,
+                reply: `Sipariş no ${orderNo} için işlem başlatmak üzere Profil > Siparişlerim > Sipariş Detayı ekranına gidin. Kargoya verilmediyse iptal, verildiyse iade talebi oluşturabilirsiniz.`
+            };
+        }
+
         return {
             intent: matchedIntent.intent,
             reply: matchedIntent.answer
@@ -138,7 +157,7 @@ const getFallbackSupportReply = (message) => {
     };
 };
 
-const getOpenAISupportReply = async (message, history = []) => {
+const getOpenAISupportReply = async (message, history = [], orderNo = null) => {
     if (!OPENAI_API_KEY || typeof fetch !== 'function') {
         return null;
     }
@@ -153,7 +172,7 @@ const getOpenAISupportReply = async (message, history = []) => {
             .filter((h) => h.text)
         : [];
 
-    const systemPrompt = `Sen Vitrin uygulamasının destek asistanısın.\nTürkçe, net, kısa ve aksiyon odaklı yanıt ver.\nÖncelik: kargo takibi, iade, iptal, müşteri hizmetleri.\nUydurma bilgi verme; emin değilsen kullanıcıyı yardım merkezine yönlendir.`;
+    const systemPrompt = `Sen Vitrin uygulamasının destek asistanısın.\nTürkçe, net, kısa ve aksiyon odaklı yanıt ver.\nÖncelik: kargo takibi, iade, iptal, müşteri hizmetleri.\nUydurma bilgi verme; emin değilsen kullanıcıyı yardım merkezine yönlendir.\nKullanıcı sipariş numarası verdiyse cevapta bunu kullanarak kişiselleştirilmiş adım ver.`;
 
     const input = [
         {
@@ -167,7 +186,13 @@ const getOpenAISupportReply = async (message, history = []) => {
         {
             role: 'user',
             content: [{ type: 'input_text', text: String(message || '').slice(0, 1000) }]
-        }
+        },
+        ...(orderNo
+            ? [{
+                role: 'user',
+                content: [{ type: 'input_text', text: `Kullanıcının sipariş numarası: ${orderNo}` }]
+            }]
+            : [])
     ];
 
     try {
@@ -679,7 +704,7 @@ app.post('/api/products', authenticate, (req, res) => {
 
 // Destek Asistanı (AI + fallback)
 app.post('/api/support/chat', async (req, res) => {
-    const { message, history } = req.body || {};
+    const { message, history, orderNo } = req.body || {};
 
     if (!message || !String(message).trim()) {
         return res.status(400).json({
@@ -689,14 +714,16 @@ app.post('/api/support/chat', async (req, res) => {
     }
 
     const normalizedMessage = String(message).trim().slice(0, 1000);
-    const fallback = getFallbackSupportReply(normalizedMessage);
-    const aiReply = await getOpenAISupportReply(normalizedMessage, history);
+    const normalizedOrderNo = normalizeOrderNo(orderNo);
+    const fallback = getFallbackSupportReply(normalizedMessage, normalizedOrderNo);
+    const aiReply = await getOpenAISupportReply(normalizedMessage, history, normalizedOrderNo);
 
     return res.status(200).json({
         success: true,
         reply: aiReply || fallback.reply,
         intent: fallback.intent,
         usedAI: Boolean(aiReply),
+        orderNo: normalizedOrderNo,
         suggestions: [
             'Kargom nerede?',
             'İade nasıl yaparım?',

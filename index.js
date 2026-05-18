@@ -114,6 +114,19 @@ db.exec(`
     )
 `);
 
+// Takip edilen satıcılar tablosu
+db.exec(`
+    CREATE TABLE IF NOT EXISTS follows (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id    INTEGER NOT NULL,
+        seller_id  INTEGER NOT NULL,
+        created_at TEXT    DEFAULT (datetime('now')),
+        UNIQUE (user_id, seller_id),
+        FOREIGN KEY (user_id) REFERENCES users(id),
+        FOREIGN KEY (seller_id) REFERENCES users(id)
+    )
+`);
+
 // Var olan veritabanları için sütun migration yardımcıları
 const ensureColumn = (tableName, columnName, definition) => {
     const columns = db.prepare(`PRAGMA table_info(${tableName})`).all().map((c) => c.name);
@@ -1161,6 +1174,128 @@ app.delete('/api/favorites/:productId', authenticate, (req, res) => {
 
     db.prepare('DELETE FROM favorites WHERE user_id = ? AND product_id = ?').run(req.user.id, productId);
     return res.status(200).json({ success: true, message: 'Favorilerden kaldırıldı.', isFavorite: false });
+});
+
+// ─── Takip Endpoint'leri ───────────────────────────────────────────────────
+
+app.get('/api/follows', authenticate, (req, res) => {
+    const sellers = db.prepare(`
+        SELECT
+            f.seller_id,
+            f.created_at,
+            COALESCE(u.name, u.email) AS seller_name,
+            COALESCE(u.seller_rating, 0) AS seller_rating,
+            COALESCE(u.total_sales, 0) AS total_sales,
+            (
+                SELECT COUNT(*) FROM follows f2 WHERE f2.seller_id = f.seller_id
+            ) AS follower_count
+        FROM follows f
+        JOIN users u ON u.id = f.seller_id
+        WHERE f.user_id = ?
+        ORDER BY f.id DESC
+    `).all(req.user.id);
+
+    return res.status(200).json({ success: true, sellers });
+});
+
+app.post('/api/follows/:sellerId', authenticate, (req, res) => {
+    const sellerId = Number(req.params.sellerId);
+    if (!Number.isInteger(sellerId) || sellerId <= 0) {
+        return res.status(400).json({ success: false, message: 'Geçersiz satıcı.' });
+    }
+
+    if (sellerId === Number(req.user.id)) {
+        return res.status(400).json({ success: false, message: 'Kendini takip edemezsin.' });
+    }
+
+    const seller = db.prepare('SELECT id FROM users WHERE id = ?').get(sellerId);
+    if (!seller) {
+        return res.status(404).json({ success: false, message: 'Satıcı bulunamadı.' });
+    }
+
+    const exists = db.prepare('SELECT id FROM follows WHERE user_id = ? AND seller_id = ?').get(req.user.id, sellerId);
+    if (exists) {
+        return res.status(200).json({ success: true, message: 'Zaten takip ediliyor.', isFollowing: true });
+    }
+
+    db.prepare('INSERT INTO follows (user_id, seller_id) VALUES (?, ?)').run(req.user.id, sellerId);
+    return res.status(201).json({ success: true, message: 'Satıcı takip edildi.', isFollowing: true });
+});
+
+app.delete('/api/follows/:sellerId', authenticate, (req, res) => {
+    const sellerId = Number(req.params.sellerId);
+    if (!Number.isInteger(sellerId) || sellerId <= 0) {
+        return res.status(400).json({ success: false, message: 'Geçersiz satıcı.' });
+    }
+
+    db.prepare('DELETE FROM follows WHERE user_id = ? AND seller_id = ?').run(req.user.id, sellerId);
+    return res.status(200).json({ success: true, message: 'Takipten çıkarıldı.', isFollowing: false });
+});
+
+// ─── Öneri Endpoint'i ──────────────────────────────────────────────────────
+
+app.get('/api/products/recommended', authenticate, (req, res) => {
+    const userId = Number(req.user.id);
+
+    const followedSellerIds = db.prepare(
+        'SELECT seller_id FROM follows WHERE user_id = ?'
+    ).all(userId).map((r) => Number(r.seller_id));
+
+    const favoriteSignals = db.prepare(`
+        SELECT p.category, p.brand
+        FROM favorites f
+        JOIN products p ON p.id = f.product_id
+        WHERE f.user_id = ?
+        ORDER BY f.id DESC
+        LIMIT 30
+    `).all(userId);
+
+    const likedCategories = new Set(
+        favoriteSignals.map((x) => String(x.category || '').toLowerCase()).filter(Boolean)
+    );
+    const likedBrands = new Set(
+        favoriteSignals.map((x) => String(x.brand || '').toLowerCase()).filter(Boolean)
+    );
+
+    const products = db.prepare(`
+        SELECT
+            p.id,
+            p.user_id,
+            p.title,
+            p.price,
+            p.category,
+            p.brand,
+            p.size,
+            p.item_condition,
+            p.shipping_type,
+            p.package_size,
+            p.image_url,
+            p.description,
+            p.created_at,
+            COALESCE(u.name, u.email) AS seller_name,
+            COALESCE(u.seller_rating, 0) AS seller_rating
+        FROM products p
+        JOIN users u ON u.id = p.user_id
+        WHERE p.user_id != ?
+        ORDER BY p.id DESC
+        LIMIT 140
+    `).all(userId);
+
+    const scored = products.map((p) => {
+        let score = 0;
+        if (followedSellerIds.includes(Number(p.user_id))) score += 50;
+        if (likedCategories.has(String(p.category || '').toLowerCase())) score += 18;
+        if (likedBrands.has(String(p.brand || '').toLowerCase())) score += 14;
+        if (Number(p.seller_rating) >= 4.5) score += 6;
+        return { ...p, rec_score: score };
+    });
+
+    scored.sort((a, b) => b.rec_score - a.rec_score || b.id - a.id);
+
+    return res.status(200).json({
+        success: true,
+        products: scored.slice(0, 30)
+    });
 });
 
 // Destek Asistanı (AI + fallback)

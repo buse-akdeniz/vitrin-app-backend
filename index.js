@@ -1,3 +1,6 @@
+// Ortam değişkenlerini .env dosyasından yükle (güvenli config)
+require('dotenv').config();
+
 // Express kütüphanesini projemize dahil ediyoruz (Import / İçe Aktarma)
 const express = require('express');
 const fs = require('fs');
@@ -10,11 +13,20 @@ const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const multer = require('multer');
 
+// Güvenlik middleware'leri
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+
 // SQLite veritabanı kütüphanesini dahil ediyoruz
 const Database = require('better-sqlite3');
 
-// JWT imzalamak için gizli anahtar (production'da .env dosyasına taşınacak)
-const JWT_SECRET = 'dolap_gizli_anahtar_2026';
+// JWT imzalamak için gizli anahtar — .env dosyasından okunur, kaynak koduna gömülmez
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+    console.error('HATA: JWT_SECRET ortam değişkeni tanımlı değil! .env dosyasını kontrol edin.');
+    process.exit(1);
+}
+
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 
@@ -230,11 +242,52 @@ if (!fs.existsSync(uploadsDir)) {
     fs.mkdirSync(uploadsDir, { recursive: true });
 }
 
+// İzin verilen görsel uzantıları ve MIME tipleri (whitelist)
+const ALLOWED_IMAGE_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp']);
+const ALLOWED_IMAGE_MIMES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+
+// Magic byte imzaları — dosyanın gerçekten görsel olduğunu doğrular
+const IMAGE_MAGIC_BYTES = [
+    { mime: 'image/jpeg', bytes: [0xFF, 0xD8, 0xFF] },
+    { mime: 'image/png',  bytes: [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A] },
+    { mime: 'image/gif',  bytes: [0x47, 0x49, 0x46, 0x38] },
+    { mime: 'image/webp', bytes: [0x52, 0x49, 0x46, 0x46] } // RIFF header
+];
+
+/**
+ * Kaydedilmiş dosyanın ilk byte'larını okuyarak gerçek bir görsel mi diye doğrular.
+ * Sahte/zararlı dosyaları tespit eder ve reddeder.
+ */
+const validateImageMagicBytes = (filePath) => {
+    try {
+        const fd = fs.openSync(filePath, 'r');
+        const buffer = Buffer.alloc(12);
+        fs.readSync(fd, buffer, 0, 12, 0);
+        fs.closeSync(fd);
+
+        for (const sig of IMAGE_MAGIC_BYTES) {
+            const match = sig.bytes.every((byte, i) => buffer[i] === byte);
+            if (match) {
+                // WebP için ek WEBP marker kontrolü (byte 8-11)
+                if (sig.mime === 'image/webp') {
+                    return buffer.slice(8, 12).toString('ascii') === 'WEBP';
+                }
+                return true;
+            }
+        }
+        return false;
+    } catch {
+        return false;
+    }
+};
+
 const uploadStorage = multer.diskStorage({
     destination: (_req, _file, cb) => cb(null, uploadsDir),
     filename: (_req, file, cb) => {
-        const ext = path.extname(file.originalname || '').toLowerCase() || '.jpg';
-        cb(null, `product-${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`);
+        // Orijinal uzantıyı al; whitelist dışındaysa .jpg yap
+        const origExt = path.extname(file.originalname || '').toLowerCase();
+        const safeExt = ALLOWED_IMAGE_EXTENSIONS.has(origExt) ? origExt : '.jpg';
+        cb(null, `product-${Date.now()}-${Math.round(Math.random() * 1e9)}${safeExt}`);
     }
 });
 
@@ -242,18 +295,69 @@ const upload = multer({
     storage: uploadStorage,
     limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB
     fileFilter: (_req, file, cb) => {
-        if (!file.mimetype || !file.mimetype.startsWith('image/')) {
-            return cb(new Error('Sadece görsel dosyası yüklenebilir.'));
+        // 1. MIME type kontrolü (whitelist)
+        if (!file.mimetype || !ALLOWED_IMAGE_MIMES.has(file.mimetype)) {
+            return cb(new Error('Sadece görsel dosyası yüklenebilir (jpg, png, gif, webp).'));
+        }
+        // 2. Uzantı kontrolü (çift uzantı saldırısını engeller: evil.php.png)
+        const ext = path.extname(file.originalname || '').toLowerCase();
+        if (ext && !ALLOWED_IMAGE_EXTENSIONS.has(ext)) {
+            return cb(new Error(`İzin verilmeyen dosya uzantısı: ${ext}`));
         }
         cb(null, true);
     }
 });
 
 // Sunucunun çalışacağı kapı numarasını (Port) belirliyoruz
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
+
+// ─── Güvenlik Middleware'leri ───────────────────────────────────────────────
+
+// Helmet: XSS, clickjacking, MIME sniffing vb. saldırılara karşı HTTP header'ları ekler
+app.use(helmet({
+    crossOriginResourcePolicy: { policy: 'cross-origin' } // Uploads statik dosyaları için
+}));
+
+// CORS: Sadece güvenilir origin'lerden gelen isteklere izin ver
+app.use((req, res, next) => {
+    const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
+        .split(',').map((o) => o.trim()).filter(Boolean);
+
+    const origin = req.headers.origin;
+    // Development modunda veya izin verilen origin ise header ekle
+    if (!origin || process.env.NODE_ENV === 'development' || allowedOrigins.includes(origin)) {
+        res.setHeader('Access-Control-Allow-Origin', origin || '*');
+    }
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
+    next();
+});
+
+// Rate Limiting: Auth endpoint'lerinde brute-force saldırısını engelle
+const authLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 dakika
+    max: 20,                   // Aynı IP'den 15 dakikada max 20 istek
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { success: false, message: 'Çok fazla deneme. 15 dakika sonra tekrar deneyin.' }
+});
+
+// Genel API rate limit (DDoS koruması)
+const apiLimiter = rateLimit({
+    windowMs: 1 * 60 * 1000, // 1 dakika
+    max: 120,                 // Dakikada max 120 istek
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { success: false, message: 'İstek limiti aşıldı. Lütfen bekleyin.' }
+});
+
+app.use('/api/', apiLimiter);
+
+// ───────────────────────────────────────────────────────────────────────────
 
 // Sunucunun gelen JSON formatındaki paketleri (verileri) okumasını sağlar
-app.use(express.json());
+app.use(express.json({ limit: '1mb' })); // payload boyutunu sınırla
 app.use('/uploads', express.static(uploadsDir));
 
 const supportIntents = [
@@ -575,8 +679,8 @@ app.get('/', (req, res) => {
     res.send('Dolap Uygulaması Sunucusu Canlı ve Çalışıyor!');
 });
 
-// Kullanıcı Kayıt Kapısı (Register Endpoint)
-app.post('/api/register', async (req, res) => {
+// Kullanıcı Kayıt Kapısı (Register Endpoint) — rate limit ile korunur
+app.post('/api/register', authLimiter, async (req, res) => {
     // 1. Flutter'dan gelen paketin içinden email ve password'ü çıkartıyoruz
     const { email, password } = req.body;
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -638,8 +742,8 @@ app.post('/api/register', async (req, res) => {
     });
 });
 
-// Kullanıcı Giriş Kapısı (Login Endpoint)
-app.post('/api/login', async (req, res) => {
+// Kullanıcı Giriş Kapısı (Login Endpoint) — rate limit ile korunur
+app.post('/api/login', authLimiter, async (req, res) => {
     const { email, password } = req.body;
 
     // 1. Boş alan kontrolü
@@ -1105,6 +1209,16 @@ app.post('/api/products/upload', authenticate, upload.single('image'), (req, res
         return res.status(400).json({
             success: false,
             message: 'Lütfen bir ürün görseli seçin!'
+        });
+    }
+
+    // Magic byte doğrulaması: Dosya gerçekten görsel mi?
+    // MIME type istemci tarafından sahte gönderilebilir; asıl içeriği kontrol et
+    if (!validateImageMagicBytes(req.file.path)) {
+        fs.unlink(req.file.path, () => {}); // Sahte dosyayı sil
+        return res.status(400).json({
+            success: false,
+            message: 'Yüklenen dosya geçerli bir görsel değil.'
         });
     }
 

@@ -15,6 +15,12 @@ const JWT_SECRET = 'dolap_gizli_anahtar_2026';
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 
+const createAuthToken = (user) => jwt.sign(
+    { id: user.id, email: user.email },
+    JWT_SECRET,
+    { expiresIn: '7d' }
+);
+
 // Veritabanı dosyasını oluşturuyor / açıyoruz (dolap.db adında bir dosya oluşacak)
 const db = new Database('dolap.db');
 
@@ -432,9 +438,11 @@ app.post('/api/register', async (req, res) => {
     const hashedPassword = await bcrypt.hash(password, saltRounds);
 
     // 6. Kullanıcıyı veritabanına kaydediyoruz
+    let createdUser;
     try {
         const stmt = db.prepare('INSERT INTO users (email, password) VALUES (?, ?)');
         const result = stmt.run(email, hashedPassword);
+        createdUser = { id: Number(result.lastInsertRowid), email };
         console.log(`Yeni kullanıcı kaydedildi — ID: ${result.lastInsertRowid}, E-posta: ${email}`);
     } catch (err) {
         // Aynı e-posta zaten kayıtlıysa hata dönüyoruz
@@ -447,11 +455,14 @@ app.post('/api/register', async (req, res) => {
         throw err; // Beklenmedik hatalarda yukarı fırlat
     }
 
-    // 7. Flutter'a kayıt başarılı mesajı ve geçici bir token dönüyoruz
+    // 7. Flutter'a kayıt başarılı mesajı ve gerçek JWT token dönüyoruz
+    const token = createAuthToken(createdUser);
+
     res.status(201).json({
         success: true,
         message: 'Kullanıcı başarıyla kaydedildi.',
-        token: 'sahte_token_xyz123'
+        token,
+        user: createdUser
     });
 });
 
@@ -486,11 +497,7 @@ app.post('/api/login', async (req, res) => {
     }
 
     // 4. Kimlik doğrulama başarılı — JWT token üret (7 gün geçerli)
-    const token = jwt.sign(
-        { id: user.id, email: user.email },
-        JWT_SECRET,
-        { expiresIn: '7d' }
-    );
+    const token = createAuthToken(user);
 
     console.log(`Kullanıcı giriş yaptı: ${email}`);
 

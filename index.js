@@ -517,7 +517,8 @@ app.post('/api/login', async (req, res) => {
 // Korumalı endpoint'lere gelmeden önce token'ı kontrol eder
 const authenticate = (req, res, next) => {
     const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1]; // "Bearer <token>"
+    const hasBearer = typeof authHeader === 'string' && authHeader.startsWith('Bearer ');
+    const token = hasBearer ? authHeader.slice(7).trim() : null;
 
     if (!token) {
         return res.status(401).json({
@@ -563,7 +564,14 @@ app.get('/api/profile', authenticate, (req, res) => {
         return res.status(404).json({ success: false, message: 'Kullanıcı bulunamadı!' });
     }
 
-    res.status(200).json({ success: true, user });
+    const showcase = db.prepare(
+        `SELECT id, title, price, image_url, created_at
+         FROM products
+         WHERE user_id = ?
+         ORDER BY datetime(created_at) DESC`
+    ).all(req.user.id);
+
+    res.status(200).json({ success: true, user, showcase });
 });
 
 // Profil Güncelleme (PUT)

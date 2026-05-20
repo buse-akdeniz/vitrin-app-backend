@@ -538,6 +538,19 @@ const authenticate = (req, res, next) => {
     }
 };
 
+// Jeton doğrulama (Splash sırasında kullanılacak)
+app.get('/api/auth/verify', authenticate, (req, res) => {
+    const user = db.prepare(
+        'SELECT id, email, name, created_at FROM users WHERE id = ?'
+    ).get(req.user.id);
+
+    if (!user) {
+        return res.status(401).json({ success: false, message: 'Kullanıcı bulunamadı.' });
+    }
+
+    return res.status(200).json({ success: true, user });
+});
+
 // ─── Profil Endpoint'leri ────────────────────────────────────────────────────
 
 // Profil Görüntüleme (GET)

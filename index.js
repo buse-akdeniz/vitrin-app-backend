@@ -21,7 +21,7 @@ const rateLimit = require('express-rate-limit');
 const Database = require('better-sqlite3');
 
 // JWT imzalamak için gizli anahtar — .env dosyasından okunur, kaynak koduna gömülmez
-const JWT_SECRET = process.env.JWT_SECRET;
+const JWT_SECRET = VitrinApp.Variable-RVScODe1354575890-;:;
 if (!JWT_SECRET) {
     console.error('HATA: JWT_SECRET ortam değişkeni tanımlı değil! .env dosyasını kontrol edin.');
     process.exit(1);

@@ -1,11 +1,14 @@
 // Express kütüphanesini projemize dahil ediyoruz (Import / İçe Aktarma)
 const express = require('express');
+const fs = require('fs');
+const path = require('path');
 
 // Şifreleri güvenli şekilde şifrelemek için bcrypt kütüphanesini dahil ediyoruz
 const bcrypt = require('bcrypt');
 
 // JWT (JSON Web Token) kütüphanesini dahil ediyoruz — dijital kimlik kartı üretimi için
 const jwt = require('jsonwebtoken');
+const multer = require('multer');
 
 // SQLite veritabanı kütüphanesini dahil ediyoruz
 const Database = require('better-sqlite3');
@@ -221,12 +224,37 @@ console.log('Veritabanı bağlantısı kuruldu ve tablo hazır.');
 
 // Express uygulamasını başlatıyoruz
 const app = express();
+const uploadsDir = path.join(__dirname, 'uploads');
+
+if (!fs.existsSync(uploadsDir)) {
+    fs.mkdirSync(uploadsDir, { recursive: true });
+}
+
+const uploadStorage = multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, uploadsDir),
+    filename: (_req, file, cb) => {
+        const ext = path.extname(file.originalname || '').toLowerCase() || '.jpg';
+        cb(null, `product-${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`);
+    }
+});
+
+const upload = multer({
+    storage: uploadStorage,
+    limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB
+    fileFilter: (_req, file, cb) => {
+        if (!file.mimetype || !file.mimetype.startsWith('image/')) {
+            return cb(new Error('Sadece görsel dosyası yüklenebilir.'));
+        }
+        cb(null, true);
+    }
+});
 
 // Sunucunun çalışacağı kapı numarasını (Port) belirliyoruz
 const PORT = 3000;
 
 // Sunucunun gelen JSON formatındaki paketleri (verileri) okumasını sağlar
 app.use(express.json());
+app.use('/uploads', express.static(uploadsDir));
 
 const supportIntents = [
     {
@@ -905,6 +933,106 @@ app.post('/api/products', authenticate, (req, res) => {
     res.status(201).json({
         success: true,
         message: 'Ürün başarıyla eklendi.',
+        product: createdProduct
+    });
+});
+
+// Ürün Ekleme + Görsel Yükleme (multipart/form-data)
+app.post('/api/products/upload', authenticate, upload.single('image'), (req, res) => {
+    const {
+        title,
+        price,
+        category,
+        brand,
+        size,
+        fabricType,
+        shoeSize,
+        gender,
+        condition,
+        shippingType,
+        packageSize,
+        color,
+        description,
+        isSos,
+        sosDiscountPercent
+    } = req.body;
+
+    if (!req.file) {
+        return res.status(400).json({
+            success: false,
+            message: 'Lütfen bir ürün görseli seçin!'
+        });
+    }
+
+    if (!title || price === undefined || price === null) {
+        return res.status(400).json({
+            success: false,
+            message: 'Ürün başlığı ve fiyat zorunludur!'
+        });
+    }
+
+    const parsedPrice = Number(price);
+    if (Number.isNaN(parsedPrice) || parsedPrice <= 0) {
+        return res.status(400).json({
+            success: false,
+            message: 'Fiyat geçerli bir sayı olmalıdır!'
+        });
+    }
+
+    let isSosMode = String(isSos || '').toLowerCase() === 'true' || Number(isSos) === 1 ? 1 : 0;
+    let discountPercent = 0;
+    if (isSosMode) {
+        const discount = Number(sosDiscountPercent);
+        if (Number.isNaN(discount) || discount < 0 || discount > 99) {
+            return res.status(400).json({
+                success: false,
+                message: 'SOS indirim yüzdesı 0-99 arasında olmalıdır!'
+            });
+        }
+        discountPercent = Math.floor(discount);
+    }
+
+    const imageUrl = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
+
+    const result = db.prepare(`
+        INSERT INTO products (
+            user_id, title, price, category, brand, size, fabric_type,
+            shoe_size, gender, item_condition, shipping_type, package_size, color,
+            image_url, description, is_sos, sos_discount_percent
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+        req.user.id,
+        String(title).trim(),
+        parsedPrice,
+        category ? String(category).trim() : '',
+        brand ? String(brand).trim() : '',
+        size ? String(size).trim() : '',
+        fabricType ? String(fabricType).trim() : '',
+        shoeSize ? String(shoeSize).trim() : '',
+        gender ? String(gender).trim() : '',
+        condition ? String(condition).trim() : '',
+        shippingType ? String(shippingType).trim() : 'seller',
+        packageSize ? String(packageSize).trim() : 'medium',
+        color ? String(color).trim() : '',
+        imageUrl,
+        description ? String(description).trim() : '',
+        isSosMode,
+        discountPercent
+    );
+
+    const createdProduct = db.prepare(`
+        SELECT
+            id, title, price, category, brand, size, fabric_type, shoe_size,
+            gender, item_condition, shipping_type, package_size, color, image_url, description,
+            is_sos, sos_discount_percent, created_at
+        FROM products
+        WHERE id = ?
+    `).get(result.lastInsertRowid);
+
+    return res.status(201).json({
+        success: true,
+        message: 'Ürün görseliyle birlikte başarıyla yüklendi.',
         product: createdProduct
     });
 });
@@ -1734,6 +1862,21 @@ app.post('/api/support/chat', async (req, res) => {
             'Canlı desteğe nasıl bağlanırım?'
         ]
     });
+});
+
+app.use((err, _req, res, next) => {
+    if (err instanceof multer.MulterError) {
+        if (err.code === 'LIMIT_FILE_SIZE') {
+            return res.status(400).json({ success: false, message: 'Görsel en fazla 5MB olabilir.' });
+        }
+        return res.status(400).json({ success: false, message: err.message || 'Dosya yükleme hatası.' });
+    }
+
+    if (err && err.message && err.message.includes('görsel')) {
+        return res.status(400).json({ success: false, message: err.message });
+    }
+
+    return next(err);
 });
 
 // Sunucuyu belirtilen port üzerinden dinlemeye (Listen) alıyoruz

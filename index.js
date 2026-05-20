@@ -426,6 +426,131 @@ const getOpenAISupportReply = async (message, history = [], orderNo = null) => {
     }
 };
 
+const buildWardrobeText = (wardrobe = []) => {
+    if (!Array.isArray(wardrobe) || wardrobe.length === 0) {
+        return 'Kullanıcının gardırobunda kayıtlı ürün yok.';
+    }
+
+    return wardrobe
+        .slice(0, 80)
+        .map((item, index) => {
+            const title = String(item.title || '').trim();
+            const category = String(item.category || '').trim();
+            const color = String(item.color || '').trim();
+            const brand = String(item.brand || '').trim();
+            const size = String(item.size || '').trim();
+            const condition = String(item.item_condition || '').trim();
+
+            return `${index + 1}) başlık: ${title || '-'}, kategori: ${category || '-'}, renk: ${color || '-'}, marka: ${brand || '-'}, beden: ${size || '-'}, durum: ${condition || '-'}`;
+        })
+        .join('\n');
+};
+
+const getFallbackStylistReply = (message, wardrobe = []) => {
+    if (!Array.isArray(wardrobe) || wardrobe.length === 0) {
+        return {
+            intent: 'empty_wardrobe',
+            reply: 'Gardırobunda henüz ürün görünmüyor. Önce 3-5 parça (üst, alt, ayakkabı) ekle; ardından sana kombin önereyim.'
+        };
+    }
+
+    const tops = wardrobe.filter((w) => /gömlek|tişört|tshirt|bluz|kazak|sweat|ceket|hırka/i.test(String(w.category || '') + ' ' + String(w.title || '')));
+    const bottoms = wardrobe.filter((w) => /pantolon|etek|şort|jean|kot/i.test(String(w.category || '') + ' ' + String(w.title || '')));
+    const shoes = wardrobe.filter((w) => /ayakkabı|sneaker|bot|topuklu|loafer/i.test(String(w.category || '') + ' ' + String(w.title || '')));
+
+    const top = tops[0] || wardrobe[0];
+    const bottom = bottoms[0] || wardrobe[Math.min(1, wardrobe.length - 1)] || wardrobe[0];
+    const shoe = shoes[0] || wardrobe[Math.min(2, wardrobe.length - 1)] || wardrobe[0];
+
+    const userContext = String(message || '').toLowerCase();
+    const vibe = /iş görüşme|ofis|toplantı/.test(userContext)
+        ? 'daha profesyonel'
+        : /akşam|yemek|date|buluşma/.test(userContext)
+            ? 'daha şık'
+            : 'dengeli ve rahat';
+
+    return {
+        intent: 'stylist_fallback',
+        reply: `Sana ${vibe} bir kombin öneriyorum:\n• Üst: ${top?.title || '-'}\n• Alt: ${bottom?.title || '-'}\n• Ayakkabı: ${shoe?.title || '-'}\n\nİstersen ortamı (ofis, günlük, akşam) ve hava durumunu yaz; daha net kombin çıkarayım.`
+    };
+};
+
+const getOpenAIStylistReply = async (message, wardrobe = [], history = []) => {
+    if (!OPENAI_API_KEY || typeof fetch !== 'function') {
+        return null;
+    }
+
+    const safeHistory = Array.isArray(history)
+        ? history
+            .slice(-10)
+            .map((h) => ({
+                role: h.role === 'assistant' ? 'assistant' : 'user',
+                text: String(h.text || '').slice(0, 500)
+            }))
+            .filter((h) => h.text)
+        : [];
+
+    const wardrobeText = buildWardrobeText(wardrobe);
+
+    const systemPrompt = `Sen Vitrin uygulamasının AI stil asistanısın.
+Türkçe, kısa, net ve giyilebilir kombin önerileri ver.
+Sadece kullanıcının gardırobundaki parçaları kullanarak öneri üret.
+Yanıt formatı:
+1) Kombin önerisi (üst/alt/ayakkabı/dış giyim)
+2) Neden uyumlu olduğuna dair 1-2 kısa gerekçe
+3) Alternatif (günlük veya daha şık)
+Uydurma ürün üretme.`;
+
+    const input = [
+        {
+            role: 'system',
+            content: [{ type: 'input_text', text: systemPrompt }]
+        },
+        {
+            role: 'user',
+            content: [{ type: 'input_text', text: `Kullanıcı gardırobu:\n${wardrobeText}` }]
+        },
+        ...safeHistory.map((h) => ({
+            role: h.role,
+            content: [{ type: 'input_text', text: h.text }]
+        })),
+        {
+            role: 'user',
+            content: [{ type: 'input_text', text: String(message || '').slice(0, 1000) }]
+        }
+    ];
+
+    try {
+        const response = await fetch('https://api.openai.com/v1/responses', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${OPENAI_API_KEY}`
+            },
+            body: JSON.stringify({
+                model: OPENAI_MODEL,
+                input,
+                temperature: 0.4,
+                max_output_tokens: 320
+            })
+        });
+
+        if (!response.ok) {
+            return null;
+        }
+
+        const data = await response.json();
+        const reply = data?.output_text?.trim();
+        if (!reply) {
+            return null;
+        }
+
+        return reply;
+    } catch (_err) {
+        return null;
+    }
+};
+
 // Ana sayfaya (/) bir istek (Request) geldiğinde çalışacak test rotası (Route)
 app.get('/', (req, res) => {
     res.send('Dolap Uygulaması Sunucusu Canlı ve Çalışıyor!');
@@ -1860,6 +1985,43 @@ app.post('/api/support/chat', async (req, res) => {
             'İade nasıl yaparım?',
             'Sipariş iptali mümkün mü?',
             'Canlı desteğe nasıl bağlanırım?'
+        ]
+    });
+});
+
+app.post('/api/stylist/chat', authenticate, async (req, res) => {
+    const { message, history } = req.body || {};
+
+    if (!message || !String(message).trim()) {
+        return res.status(400).json({
+            success: false,
+            message: 'Mesaj alanı zorunludur.'
+        });
+    }
+
+    const wardrobe = db.prepare(`
+        SELECT id, title, category, color, brand, size, item_condition, image_url
+        FROM products
+        WHERE user_id = ?
+        ORDER BY datetime(created_at) DESC
+        LIMIT 120
+    `).all(req.user.id);
+
+    const normalizedMessage = String(message).trim().slice(0, 1000);
+    const fallback = getFallbackStylistReply(normalizedMessage, wardrobe);
+    const aiReply = await getOpenAIStylistReply(normalizedMessage, wardrobe, history);
+
+    return res.status(200).json({
+        success: true,
+        reply: aiReply || fallback.reply,
+        intent: fallback.intent,
+        usedAI: Boolean(aiReply),
+        wardrobeCount: wardrobe.length,
+        suggestions: [
+            'Bugün iş görüşmem var, ne giymeliyim?',
+            'Bu eteğin üstüne ne gider?',
+            'Hava serin, rahat ama şık kombin öner',
+            'Siyah pantolonla 2 alternatif çıkar'
         ]
     });
 });

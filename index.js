@@ -36,8 +36,15 @@ const createAuthToken = (user) => jwt.sign(
     { expiresIn: '7d' }
 );
 
-// Veritabanı dosyasını oluşturuyor / açıyoruz (dolap.db adında bir dosya oluşacak)
-const db = new Database('dolap.db');
+// Veritabanı dosya yolu (cloud ortamında persistent disk için env ile değiştirilebilir)
+const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'data', 'dolap.db');
+const dbDir = path.dirname(DB_PATH);
+if (!fs.existsSync(dbDir)) {
+    fs.mkdirSync(dbDir, { recursive: true });
+}
+
+// Veritabanı dosyasını oluşturuyor / açıyoruz
+const db = new Database(DB_PATH);
 
 // Kullanıcılar tablosunu yoksa oluşturuyoruz
 db.exec(`
@@ -236,7 +243,10 @@ console.log('Veritabanı bağlantısı kuruldu ve tablo hazır.');
 
 // Express uygulamasını başlatıyoruz
 const app = express();
-const uploadsDir = path.join(__dirname, 'uploads');
+const uploadsDir = process.env.UPLOADS_DIR || path.join(__dirname, 'uploads');
+
+// Render/Railway gibi proxy arkasında gerçek IP'yi doğru okumak için
+app.set('trust proxy', 1);
 
 if (!fs.existsSync(uploadsDir)) {
     fs.mkdirSync(uploadsDir, { recursive: true });
@@ -2158,6 +2168,14 @@ app.post('/api/stylist/chat', authenticate, async (req, res) => {
             'Hava serin, rahat ama şık kombin öner',
             'Siyah pantolonla 2 alternatif çıkar'
         ]
+    });
+});
+
+app.get('/healthz', (_req, res) => {
+    res.status(200).json({
+        success: true,
+        status: 'ok',
+        service: 'vitrin-backend'
     });
 });
 

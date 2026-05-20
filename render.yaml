@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: vitrin-app-backend
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: JWT_SECRET
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-4o-mini
+      # Not: SQLite dosyasını kalıcı tutmak için Render Disk bağlarsanız:
+      # DB_PATH=/opt/render/project/data/dolap.db
+      # UPLOADS_DIR=/opt/render/project/data/uploads

@@ -446,7 +446,16 @@ const buildWardrobeText = (wardrobe = []) => {
         .join('\n');
 };
 
-const getFallbackStylistReply = (message, wardrobe = []) => {
+const normalizeStyleContext = (occasion, weather) => {
+    const cleanOccasion = String(occasion || '').trim().slice(0, 40);
+    const cleanWeather = String(weather || '').trim().slice(0, 40);
+    return {
+        occasion: cleanOccasion,
+        weather: cleanWeather
+    };
+};
+
+const getFallbackStylistReply = (message, wardrobe = [], styleContext = {}) => {
     if (!Array.isArray(wardrobe) || wardrobe.length === 0) {
         return {
             intent: 'empty_wardrobe',
@@ -462,20 +471,26 @@ const getFallbackStylistReply = (message, wardrobe = []) => {
     const bottom = bottoms[0] || wardrobe[Math.min(1, wardrobe.length - 1)] || wardrobe[0];
     const shoe = shoes[0] || wardrobe[Math.min(2, wardrobe.length - 1)] || wardrobe[0];
 
-    const userContext = String(message || '').toLowerCase();
+    const userContext = `${String(message || '').toLowerCase()} ${String(styleContext.occasion || '').toLowerCase()}`;
     const vibe = /iş görüşme|ofis|toplantı/.test(userContext)
         ? 'daha profesyonel'
         : /akşam|yemek|date|buluşma/.test(userContext)
             ? 'daha şık'
             : 'dengeli ve rahat';
 
+    const weatherNote = /soğuk|serin|yağmur|kış/.test(String(styleContext.weather || '').toLowerCase())
+        ? '\n• Ek not: Hava serin/soğuk görünüyor, dış katman (ceket/hırka) ekle.'
+        : /sıcak|güneş|yaz/.test(String(styleContext.weather || '').toLowerCase())
+            ? '\n• Ek not: Hava sıcaksa daha hafif kumaş tercih et.'
+            : '';
+
     return {
         intent: 'stylist_fallback',
-        reply: `Sana ${vibe} bir kombin öneriyorum:\n• Üst: ${top?.title || '-'}\n• Alt: ${bottom?.title || '-'}\n• Ayakkabı: ${shoe?.title || '-'}\n\nİstersen ortamı (ofis, günlük, akşam) ve hava durumunu yaz; daha net kombin çıkarayım.`
+        reply: `Sana ${vibe} bir kombin öneriyorum:\n• Üst: ${top?.title || '-'}\n• Alt: ${bottom?.title || '-'}\n• Ayakkabı: ${shoe?.title || '-'}${weatherNote}\n\nİstersen ortamı (ofis, günlük, akşam) ve hava durumunu yaz; daha net kombin çıkarayım.`
     };
 };
 
-const getOpenAIStylistReply = async (message, wardrobe = [], history = []) => {
+const getOpenAIStylistReply = async (message, wardrobe = [], history = [], styleContext = {}) => {
     if (!OPENAI_API_KEY || typeof fetch !== 'function') {
         return null;
     }
@@ -509,6 +524,10 @@ Uydurma ürün üretme.`;
         {
             role: 'user',
             content: [{ type: 'input_text', text: `Kullanıcı gardırobu:\n${wardrobeText}` }]
+        },
+        {
+            role: 'user',
+            content: [{ type: 'input_text', text: `Kullanıcı bağlamı: ortam=${styleContext.occasion || '-'}, hava=${styleContext.weather || '-'}` }]
         },
         ...safeHistory.map((h) => ({
             role: h.role,
@@ -1990,7 +2009,7 @@ app.post('/api/support/chat', async (req, res) => {
 });
 
 app.post('/api/stylist/chat', authenticate, async (req, res) => {
-    const { message, history } = req.body || {};
+    const { message, history, occasion, weather } = req.body || {};
 
     if (!message || !String(message).trim()) {
         return res.status(400).json({
@@ -2008,8 +2027,9 @@ app.post('/api/stylist/chat', authenticate, async (req, res) => {
     `).all(req.user.id);
 
     const normalizedMessage = String(message).trim().slice(0, 1000);
-    const fallback = getFallbackStylistReply(normalizedMessage, wardrobe);
-    const aiReply = await getOpenAIStylistReply(normalizedMessage, wardrobe, history);
+    const styleContext = normalizeStyleContext(occasion, weather);
+    const fallback = getFallbackStylistReply(normalizedMessage, wardrobe, styleContext);
+    const aiReply = await getOpenAIStylistReply(normalizedMessage, wardrobe, history, styleContext);
 
     return res.status(200).json({
         success: true,
@@ -2017,6 +2037,7 @@ app.post('/api/stylist/chat', authenticate, async (req, res) => {
         intent: fallback.intent,
         usedAI: Boolean(aiReply),
         wardrobeCount: wardrobe.length,
+        styleContext,
         suggestions: [
             'Bugün iş görüşmem var, ne giymeliyim?',
             'Bu eteğin üstüne ne gider?',

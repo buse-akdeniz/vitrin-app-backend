@@ -3,18 +3,25 @@ services:
     name: vitrin-app-backend
     env: node
     plan: free
-    buildCommand: npm install
+    buildCommand: npm ci --omit=dev
     startCommand: npm start
-    healthCheckPath: /healthz
+    healthCheckPath: /health
     envVars:
       - key: NODE_ENV
         value: production
-      - key: JWT_SECRET
+      - key: AWS_REGION
+        value: eu-central-1
+      - key: S3_RAW_BUCKET
+        sync: false
+      - key: CDN_BASE_URL
+        sync: false
+      - key: UPLOAD_API_TOKEN
+        sync: false
+      - key: AUTH_SALT
         sync: false
       - key: OPENAI_API_KEY
         sync: false
-      - key: OPENAI_MODEL
+      - key: AI_MODEL
         value: gpt-4o-mini
-      # Not: SQLite dosyasını kalıcı tutmak için Render Disk bağlarsanız:
-      # DB_PATH=/opt/render/project/data/dolap.db
-      # UPLOADS_DIR=/opt/render/project/data/uploads
+      - key: DATA_DIR
+        value: /opt/render/project/data
